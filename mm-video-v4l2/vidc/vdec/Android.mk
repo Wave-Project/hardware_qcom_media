@@ -128,7 +128,9 @@ LOCAL_SRC_FILES         += src/mp4_utils.cpp
 LOCAL_SRC_FILES         += src/hevc_utils.cpp
 LOCAL_STATIC_LIBRARIES  := libOmxVidcCommon
 LOCAL_SRC_FILES         += src/omx_vdec_msm8974.cpp
-LOCAL_CLANG := false
+
+# omx_vdec_msm8974.cpp:9375:16: address of array 'extra->data' will always evaluate to 'true'
+LOCAL_CLANG_CFLAGS      += -Wno-pointer-bool-conversion
 include $(BUILD_SHARED_LIBRARY)
 
 

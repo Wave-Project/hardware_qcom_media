@@ -1,5 +1,5 @@
 /*--------------------------------------------------------------------------
-Copyright (c) 2010 - 2018, The Linux Foundation. All rights reserved.
+Copyright (c) 2010 - 2019, The Linux Foundation. All rights reserved.
 
 Redistribution and use in source and binary forms, with or without
 modification, are permitted provided that the following conditions are met:
@@ -10645,6 +10645,13 @@ OMX_ERRORTYPE omx_vdec::update_portdef(OMX_PARAM_PORTDEFINITIONTYPE *portDefn)
         return OMX_ErrorBadParameter;
     }
     DEBUG_PRINT_LOW("omx_vdec::update_portdef");
+    if (drv_ctx.frame_rate.fps_denominator > 0)
+        portDefn->format.video.xFramerate = (drv_ctx.frame_rate.fps_numerator /
+                   drv_ctx.frame_rate.fps_denominator) << 16; //Q16 format
+    else {
+        DEBUG_PRINT_ERROR("Error: Divide by zero");
+        return OMX_ErrorBadParameter;
+    }
     portDefn->nVersion.nVersion = OMX_SPEC_VERSION;
     portDefn->nSize = sizeof(OMX_PARAM_PORTDEFINITIONTYPE);
     portDefn->eDomain    = OMX_PortDomainVideo;
@@ -10656,9 +10663,6 @@ OMX_ERRORTYPE omx_vdec::update_portdef(OMX_PARAM_PORTDEFINITIONTYPE *portDefn)
         portDefn->nBufferSize        = drv_ctx.ip_buf.buffer_size;
         portDefn->format.video.eColorFormat = OMX_COLOR_FormatUnused;
         portDefn->format.video.eCompressionFormat = eCompressionFormat;
-        //for input port, always report the fps value set by client,
-        //to distinguish whether client got valid fps from parser.
-        portDefn->format.video.xFramerate = m_fps_received;
         portDefn->bEnabled   = m_inp_bEnabled;
         portDefn->bPopulated = m_inp_bPopulated;
 
@@ -10698,13 +10702,6 @@ OMX_ERRORTYPE omx_vdec::update_portdef(OMX_PARAM_PORTDEFINITIONTYPE *portDefn)
         portDefn->nBufferCountActual = drv_ctx.op_buf.actualcount;
         portDefn->nBufferCountMin    = drv_ctx.op_buf.mincount;
         portDefn->format.video.eCompressionFormat = OMX_VIDEO_CodingUnused;
-        if (drv_ctx.frame_rate.fps_denominator > 0)
-            portDefn->format.video.xFramerate = (drv_ctx.frame_rate.fps_numerator /
-                drv_ctx.frame_rate.fps_denominator) << 16; //Q16 format
-        else {
-            DEBUG_PRINT_ERROR("Error: Divide by zero");
-            return OMX_ErrorBadParameter;
-        }
         portDefn->bEnabled   = m_out_bEnabled;
         portDefn->bPopulated = m_out_bPopulated;
         if (!client_buffers.get_color_format(portDefn->format.video.eColorFormat)) {
@@ -11067,7 +11064,8 @@ void omx_vdec::convert_color_space_info(OMX_U32 primaries, OMX_U32 range,
             aspects->mPrimaries = ColorAspects::PrimariesBT2020;
             break;
         case MSM_VIDC_UNSPECIFIED:
-            //Client does not expect ColorAspects::PrimariesUnspecified, but rather the supplied default
+            aspects->mPrimaries = ColorAspects::PrimariesUnspecified;
+            break;
         default:
             //aspects->mPrimaries = ColorAspects::PrimariesOther;
             aspects->mPrimaries = m_client_color_space.sAspects.mPrimaries;
@@ -11153,6 +11151,10 @@ bool omx_vdec::handle_color_space_info(void *data)
     ColorAspects tempAspects;
     memset(&tempAspects, 0x0, sizeof(ColorAspects));
     ColorAspects *aspects = &tempAspects;
+    aspects->mRange =  ColorAspects::RangeUnspecified;
+    aspects->mPrimaries = ColorAspects::PrimariesUnspecified;
+    aspects->mMatrixCoeffs = ColorAspects::MatrixUnspecified;
+    aspects->mTransfer = ColorAspects::TransferUnspecified;
 
     switch(output_capability) {
         case V4L2_PIX_FMT_MPEG2:
@@ -11181,7 +11183,8 @@ bool omx_vdec::handle_color_space_info(void *data)
                 display_info_payload = (struct msm_vidc_vui_display_info_payload*)data;
 
                 /* Refer H264 Spec @ Rec. ITU-T H.264 (02/2014) to understand this code */
-
+                aspects->mRange = display_info_payload->video_full_range_flag ?
+                    ColorAspects::RangeFull : ColorAspects::RangeLimited;
                 if (display_info_payload->video_signal_present_flag &&
                         display_info_payload->color_description_present_flag) {
                     convert_color_space_info(display_info_payload->color_primaries,
@@ -11296,6 +11299,10 @@ bool omx_vdec::handle_color_space_info(void *data)
             m_internal_color_space.sAspects.mTransfer != aspects->mTransfer ||
             m_internal_color_space.sAspects.mMatrixCoeffs != aspects->mMatrixCoeffs ||
             m_internal_color_space.sAspects.mRange != aspects->mRange) {
+        if (aspects->mPrimaries == ColorAspects::PrimariesUnspecified) {
+            DEBUG_PRINT_LOW("ColorPrimaries is unspecified, defaulting to ColorPrimaries_BT601_6_525 before copying");
+            aspects->mPrimaries = ColorAspects::PrimariesBT601_6_525;
+        }
         memcpy(&(m_internal_color_space.sAspects), aspects, sizeof(ColorAspects));
 
         DEBUG_PRINT_HIGH("Initiating PORT Reconfig due to Color Aspects Change");
@@ -11415,6 +11422,10 @@ bool omx_vdec::handle_mastering_display_color_info(void* data)
 void omx_vdec::set_colormetadata_in_handle(ColorMetaData *color_mdata, unsigned int buf_index)
 {
     private_handle_t *private_handle = NULL;
+    if (color_mdata->colorPrimaries == (ColorPrimaries)2) {
+        DEBUG_PRINT_LOW("ColorPrimaries is unspecified, defaulting to ColorPrimaries_BT601_6_525 before setting");
+        color_mdata->colorPrimaries = ColorPrimaries_BT601_6_525;
+    }
     if (buf_index < drv_ctx.op_buf.actualcount &&
         buf_index < MAX_NUM_INPUT_OUTPUT_BUFFERS &&
         native_buffer[buf_index].privatehandle) {

@@ -256,6 +256,11 @@ void* async_message_thread (void *input)
                 }
                 if(ptr[2] & V4L2_EVENT_PICSTRUCT_FLAG) {
                     omx->m_progressive = ptr[4];
+#ifdef _MSM8996_AUTO_
+                    vdec_msg.msgdata.output_frame.interlaced_format =
+                      omx->m_progressive ? VDEC_InterlaceFrameProgressive : VDEC_InterlaceInterleaveFrameTopFieldFirst;
+#endif
+
                     DEBUG_PRINT_HIGH("VIDC Port Reconfig PicStruct change - %d", ptr[4]);
                 }
                 if(ptr[2] & V4L2_EVENT_COLOUR_SPACE_FLAG) {
@@ -2781,6 +2786,18 @@ OMX_ERRORTYPE omx_vdec::component_init(OMX_STRING role)
     if (eRet != OMX_ErrorNone) {
         DEBUG_PRINT_ERROR("Component Init Failed");
     } else {
+#ifdef _MSM8996_AUTO_
+        /* allow ubwc linear event setting to support interlaced clips
+         * playback for linux and just print warning log to show the
+         * setting fail for non-linux PVM hypervisor case for playback
+         * doesn't depend on this */
+        control.id = V4L2_CID_MPEG_VIDC_VIDEO_ALLOW_UBWC_LINEAR_EVENT;
+        control.value = V4L2_MPEG_VIDC_VIDEO_ALLOW_UBWC_LINEAR_EVENT_ENABLE;
+        ret = ioctl(drv_ctx.video_driver_fd, VIDIOC_S_CTRL, &control);
+        if (ret)
+          DEBUG_PRINT_HIGH("Failed to set control for id=%d, value=%d\n",
+                  control.id, control.value);
+#endif
         DEBUG_PRINT_INFO("omx_vdec::component_init() success : fd=%d",
                 drv_ctx.video_driver_fd);
     }
@@ -7719,6 +7736,16 @@ OMX_ERRORTYPE  omx_vdec::empty_this_buffer(OMX_IN OMX_HANDLETYPE         hComp,
         buffer->pBuffer = (OMX_U8*)drv_ctx.ptr_inputbuffer[nBufferIndex].bufferaddr;
     }
 
+    /* Check if the input timestamp in seconds is greater than LONG_MAX
+       or lesser than LONG_MIN. */
+    if (buffer->nTimeStamp / 1000000 > LONG_MAX ||
+       buffer->nTimeStamp / 1000000 < LONG_MIN) {
+        /* This timestamp cannot be contained in driver timestamp field */
+        DEBUG_PRINT_ERROR("[ETB] BHdr(%p) pBuf(%p) nTS(%lld) nFL(%u) >> Invalid timestamp",
+            buffer, buffer->pBuffer, buffer->nTimeStamp, (unsigned int)buffer->nFilledLen);
+        return OMX_ErrorBadParameter;
+    }
+
     DEBUG_PRINT_LOW("[ETB] BHdr(%p) pBuf(%p) nTS(%lld) nFL(%u)",
             buffer, buffer->pBuffer, buffer->nTimeStamp, (unsigned int)buffer->nFilledLen);
     if (arbitrary_bytes) {
@@ -9506,6 +9533,14 @@ int omx_vdec::async_message_process (void *context, void* message)
             DEBUG_PRINT_HIGH("Port settings changed");
             omx->m_reconfig_width = vdec_msg->msgdata.output_frame.picsize.frame_width;
             omx->m_reconfig_height = vdec_msg->msgdata.output_frame.picsize.frame_height;
+            if ((vdec_msg->msgdata.output_frame.interlaced_format == VDEC_InterlaceInterleaveFrameTopFieldFirst) ||
+                (vdec_msg->msgdata.output_frame.interlaced_format == VDEC_InterlaceInterleaveFrameBottomFieldFirst)) {
+                if (omx->drv_ctx.output_format != VDEC_YUV_FORMAT_NV12) {
+                    // if interlace mode, output buffer format must be NV12 linear
+                    omx->drv_ctx.output_format = VDEC_YUV_FORMAT_NV12;
+                    omx->capture_capability = V4L2_PIX_FMT_NV12;
+                }
+            }
             omx->post_event (OMX_CORE_OUTPUT_PORT_INDEX, OMX_IndexParamPortDefinition,
                     OMX_COMPONENT_GENERATE_PORT_RECONFIG);
             if (!omx->m_need_turbo) {
@@ -11184,7 +11219,7 @@ bool omx_vdec::handle_color_space_info(void *data)
 
                 /* Refer H264 Spec @ Rec. ITU-T H.264 (02/2014) to understand this code */
                 aspects->mRange = display_info_payload->video_full_range_flag ?
-                    ColorAspects::RangeFull : ColorAspects::RangeLimited;
+                    ColorAspects::RangeFull : aspects->mRange;
                 if (display_info_payload->video_signal_present_flag &&
                         display_info_payload->color_description_present_flag) {
                     convert_color_space_info(display_info_payload->color_primaries,
@@ -11299,7 +11334,8 @@ bool omx_vdec::handle_color_space_info(void *data)
             m_internal_color_space.sAspects.mTransfer != aspects->mTransfer ||
             m_internal_color_space.sAspects.mMatrixCoeffs != aspects->mMatrixCoeffs ||
             m_internal_color_space.sAspects.mRange != aspects->mRange) {
-        if (aspects->mPrimaries == ColorAspects::PrimariesUnspecified) {
+        if (aspects->mPrimaries == ColorAspects::PrimariesUnspecified &&
+            aspects->mRange == ColorAspects::RangeFull) {
             DEBUG_PRINT_LOW("ColorPrimaries is unspecified, defaulting to ColorPrimaries_BT601_6_525 before copying");
             aspects->mPrimaries = ColorAspects::PrimariesBT601_6_525;
         }
@@ -13006,8 +13042,13 @@ OMX_BUFFERHEADERTYPE* omx_vdec::allocate_color_convert_buf::get_il_buf_hdr()
 {
     bool status = true;
     pthread_mutex_lock(&omx->c_lock);
+     /* Whenever port mode is set to kPortModeDynamicANWBuffer, Video Frameworks
+        always uses VideoNativeMetadata and OMX recives buffer type as
+        grallocsource via storeMetaDataInBuffers_l API. The buffer_size
+        will be communicated to frameworks via IndexParamPortdefinition. */
     if (!enabled)
-        buffer_size = omx->drv_ctx.op_buf.buffer_size;
+        buffer_size = omx->dynamic_buf_mode ? sizeof(struct VideoNativeMetadata) :
+                      omx->drv_ctx.op_buf.buffer_size;
     else {
         if (!c2d.get_buffer_size(C2D_OUTPUT,buffer_size)) {
             DEBUG_PRINT_ERROR("Get buffer size failed");
@@ -13021,9 +13062,10 @@ fail_get_buffer_size:
 }
 
 OMX_ERRORTYPE omx_vdec::allocate_color_convert_buf::set_buffer_req(
-        OMX_U32 buffer_size, OMX_U32 actual_count) {
-    OMX_U32 expectedSize = enabled ? buffer_size_req : omx->drv_ctx.op_buf.buffer_size;
-
+        OMX_U32 buffer_size, OMX_U32 actual_count)
+{
+    OMX_U32 expectedSize = enabled ? buffer_size_req : omx->dynamic_buf_mode ?
+            sizeof(struct VideoDecoderOutputMetaData) : omx->drv_ctx.op_buf.buffer_size;
     if (buffer_size < expectedSize) {
         DEBUG_PRINT_ERROR("OP Requirements: Client size(%u) insufficient v/s requested(%u)",
                 buffer_size, expectedSize);
@@ -13085,7 +13127,7 @@ OMX_ERRORTYPE omx_vdec::allocate_color_convert_buf::free_output_buffer(
         return OMX_ErrorBadParameter;
     }
     if (pmem_fd[index] >= 0) {
-        munmap(pmem_baseaddress[index], buffer_size_req);
+        munmap(pmem_baseaddress[index], m_out_mem_ptr_client[index].nAllocLen);
         close(pmem_fd[index]);
     }
     pmem_fd[index] = -1;
